@@ -7,6 +7,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { getMe, logout } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
+import { Analytics } from "@vercel/analytics/next";
 
 const NAV_LINKS = [
   { href: "/songs", label: "Songs" },
@@ -106,6 +107,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <Nav />
           <main className="max-w-5xl mx-auto px-6 py-10">{children}</main>
         </QueryClientProvider>
+        <Analytics />
       </body>
     </html>
   );
