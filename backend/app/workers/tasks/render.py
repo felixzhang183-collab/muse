@@ -800,6 +800,43 @@ def render_video(
         with open(audio_path, "wb") as fh:
             fh.write(storage.download_file(song.file_key))
 
+        # Pre-trim audio NOW — before VideoFileClip objects are opened.
+        # Each VideoFileClip keeps an ffmpeg process alive; with 9+ clips open,
+        # any new subprocess hits the container's process/fd limit (EAGAIN).
+        # Running the trim here ensures 0 ffmpeg processes are open yet.
+        _audio_trim_path = audio_path + ".trim.wav"
+        _audio_trim_ok = False
+        try:
+            _probed_audio_dur = _ffmpeg_probe_duration(audio_path) or 0.0
+            _audio_actual_end = _probed_audio_dur if _probed_audio_dur > 0 else clip_end
+            _safe_clip_end = min(clip_end, _audio_actual_end - 0.1)
+            _trim_bin = _get_ffmpeg_path() or "ffmpeg"
+            _tr = subprocess.run(
+                [
+                    _trim_bin, "-y",
+                    "-ss", f"{clip_start:.3f}",
+                    "-i", audio_path,
+                    "-t", f"{max(0.1, _safe_clip_end - clip_start):.3f}",
+                    "-c:a", "pcm_s16le",
+                    _audio_trim_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=60,
+            )
+            _audio_trim_ok = (
+                _tr.returncode == 0
+                and os.path.exists(_audio_trim_path)
+                and os.path.getsize(_audio_trim_path) > 0
+            )
+            if not _audio_trim_ok:
+                _trim_err = _tr.stderr.decode("utf-8", errors="ignore")[-300:] if _tr.stderr else ""
+                logger.warning("Audio pre-trim failed (rc=%d): %s", _tr.returncode, _trim_err)
+            else:
+                logger.info("Audio pre-trimmed to %.2fs → %s", _safe_clip_end - clip_start, _audio_trim_path)
+        except Exception as _te:
+            logger.warning("Audio pre-trim exception: %s", _te)
+
         # ── 5. Build clips with moviepy ───────────────────────────────────
         set_job_status(task_id, "running", progress=62)
         from moviepy.editor import AudioFileClip, concatenate_videoclips
@@ -866,43 +903,11 @@ def render_video(
         set_job_status(task_id, "running", progress=78)
         final_video = concatenate_videoclips(clips, method="compose")
 
-        # Pre-trim audio to [clip_start, safe_end] using ffmpeg → WAV (PCM).
-        # WAV/PCM encoding is always available, produces exact durations, and avoids
-        # MoviePy buffer overrun from VBR MP3 files whose reported duration > actual data.
-        probed_audio_dur = _ffmpeg_probe_duration(audio_path) or 0.0
-        audio_actual_end = probed_audio_dur if probed_audio_dur > 0 else clip_end
-        safe_clip_end = min(clip_end, audio_actual_end - 0.1)
-        trim_audio_path = audio_path + ".trim.wav"
-        _audio_ffmpeg_bin = _get_ffmpeg_path() or "ffmpeg"
-        _use_trim_audio = False
-        try:
-            _r = subprocess.run(
-                [
-                    _audio_ffmpeg_bin, "-y",
-                    "-ss", f"{clip_start:.3f}",
-                    "-i", audio_path,
-                    "-t", f"{max(0.1, safe_clip_end - clip_start):.3f}",
-                    "-c:a", "pcm_s16le",
-                    trim_audio_path,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=60,
-            )
-            _use_trim_audio = (
-                _r.returncode == 0
-                and os.path.exists(trim_audio_path)
-                and os.path.getsize(trim_audio_path) > 0
-            )
-            if not _use_trim_audio:
-                _trim_err = _r.stderr.decode("utf-8", errors="ignore")[-300:] if _r.stderr else ""
-                logger.warning("Audio pre-trim failed (rc=%d): %s", _r.returncode, _trim_err)
-        except Exception as _e:
-            logger.warning("Audio pre-trim exception: %s", _e)
-
-        if _use_trim_audio:
-            # Trimmed audio already starts at 0 (ffmpeg -ss applied)
-            audio = AudioFileClip(trim_audio_path)
+        # Audio was pre-trimmed to WAV before clip extraction (see step 4.5 above).
+        # Using the pre-trimmed file avoids VBR MP3 buffer overrun AND the EAGAIN
+        # process-limit issue that occurs when 9+ VideoFileClip ffmpeg processes are open.
+        if _audio_trim_ok:
+            audio = AudioFileClip(_audio_trim_path)
             min_dur = min(final_video.duration, audio.duration)
         else:
             # Fallback: MoviePy subclip with large safety margin
