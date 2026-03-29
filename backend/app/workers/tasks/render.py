@@ -602,10 +602,13 @@ def _extract_subclip(
     if loop_if_needed and clip_dur > 0:
         # For looping (draft preview): pre-encode full video to H.264, then subclip in moviepy
         encoded_path = video_path + ".h264loop.mp4"
-        if not os.path.exists(encoded_path):
+        _encoded_valid = os.path.exists(encoded_path) and os.path.getsize(encoded_path) > 1000
+        if not _encoded_valid:
             _ffmpeg_cut_clip(video_path, 0, clip_dur, encoded_path)
-        load_path = encoded_path if os.path.exists(encoded_path) else video_path
-        clip = VideoFileClip(load_path, audio=False)
+            _encoded_valid = os.path.exists(encoded_path) and os.path.getsize(encoded_path) > 1000
+        if not _encoded_valid:
+            raise ValueError(f"Cannot re-encode video to H.264 (incompatible codec?): {video_path}")
+        clip = VideoFileClip(encoded_path, audio=False)
         from moviepy.editor import concatenate_videoclips
         remaining = float(duration)
         cursor = start_t
@@ -859,13 +862,48 @@ def render_video(
         set_job_status(task_id, "running", progress=78)
         final_video = concatenate_videoclips(clips, method="compose")
 
-        audio = AudioFileClip(audio_path)
-        # Apply clip region: trim audio to [clip_start, clip_end]
-        # Use a 0.5s safety margin to avoid reading past the end of the audio buffer
-        # (moviepy sometimes reports a duration slightly longer than actual data).
-        safe_audio_end = max(0.0, audio.duration - 0.5)
-        audio = audio.subclip(clip_start, min(clip_end, safe_audio_end))
-        min_dur = min(final_video.duration, max(0.0, audio.duration - 0.5))
+        # Pre-trim audio to [clip_start, safe_end] using ffmpeg.
+        # This is more reliable than MoviePy subclip for VBR MP3 files whose reported
+        # duration can exceed actual data, causing buffer overrun at end of file.
+        probed_audio_dur = _ffmpeg_probe_duration(audio_path) or 0.0
+        audio_actual_end = probed_audio_dur if probed_audio_dur > 0 else clip_end
+        safe_clip_end = min(clip_end, audio_actual_end - 0.1)
+        trim_audio_path = audio_path + ".trim.aac"
+        _audio_ffmpeg_bin = _get_ffmpeg_path() or "ffmpeg"
+        _use_trim_audio = False
+        try:
+            _r = subprocess.run(
+                [
+                    _audio_ffmpeg_bin, "-y",
+                    "-ss", f"{clip_start:.3f}",
+                    "-i", audio_path,
+                    "-t", f"{max(0.1, safe_clip_end - clip_start):.3f}",
+                    "-c:a", "aac", "-b:a", "192k",
+                    trim_audio_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+            _use_trim_audio = (
+                _r.returncode == 0
+                and os.path.exists(trim_audio_path)
+                and os.path.getsize(trim_audio_path) > 0
+            )
+        except Exception as _e:
+            logger.warning("Audio pre-trim failed: %s", _e)
+
+        if _use_trim_audio:
+            # Trimmed audio already starts at 0 (ffmpeg -ss applied)
+            audio = AudioFileClip(trim_audio_path)
+            min_dur = min(final_video.duration, audio.duration)
+        else:
+            # Fallback: MoviePy subclip with safety margin
+            audio = AudioFileClip(audio_path)
+            safe_audio_end = max(0.0, audio.duration - 0.5)
+            audio = audio.subclip(clip_start, min(clip_end, safe_audio_end))
+            min_dur = min(final_video.duration, max(0.0, audio.duration - 0.5))
+
         final_video = final_video.subclip(0, min_dur)
         audio = audio.subclip(0, min_dur)
         final_video = final_video.set_audio(audio)
