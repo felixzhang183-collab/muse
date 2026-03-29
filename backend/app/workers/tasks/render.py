@@ -445,9 +445,34 @@ def _ffmpeg_probe_dims(video_path: str) -> tuple[int, int] | None:
     return None
 
 
-def _ffmpeg_cut_clip(input_path: str, start: float, duration: float, output_path: str) -> bool:
-    """Extract a clip from input_path using ffmpeg. Handles H.265/HEVC. Returns True on success."""
+def _ffmpeg_cut_clip(
+    input_path: str,
+    start: float,
+    duration: float,
+    output_path: str,
+    target_w: int | None = None,
+    target_h: int | None = None,
+    cover_crop: bool = False,
+) -> bool:
+    """Extract a clip from input_path using ffmpeg. Handles H.265/HEVC. Returns True on success.
+
+    If target_w/target_h are given, resize the output to those exact dimensions.
+    cover_crop=True scales to fill then center-crops (CSS object-cover behaviour).
+    """
     ffmpeg_bin = _get_ffmpeg_path() or "ffmpeg"
+    if target_w and target_h:
+        if cover_crop:
+            # scale so both dims >= target, then crop to center
+            vf = (
+                f"scale=w='if(gt(iw/ih,{target_w}/{target_h}),{target_w},-2)':"
+                f"h='if(gt(iw/ih,{target_w}/{target_h}),-2,{target_h})',"
+                f"crop={target_w}:{target_h}"
+            )
+        else:
+            vf = f"scale={target_w}:{target_h}"
+    else:
+        # just ensure even dimensions (libx264 requirement)
+        vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
     try:
         result = subprocess.run(
             [
@@ -455,8 +480,7 @@ def _ffmpeg_cut_clip(input_path: str, start: float, duration: float, output_path
                 "-ss", f"{start:.3f}",
                 "-i", input_path,
                 "-t", f"{duration:.3f}",
-                # scale to even dimensions (libx264 requires width/height divisible by 2)
-                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-vf", vf,
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                 "-an",
                 output_path,
@@ -568,17 +592,11 @@ def _extract_subclip(
     explicit_start_sec: float | None = None,
     loop_if_needed: bool = False,
     cover_crop: bool = False,
-):
-    """
-    Extract `duration` seconds from video_path, resize to target dimensions.
-    Uses ffmpeg subprocess for clip extraction to support all codecs (H.265/HEVC, H.264, etc.).
-    Returns a moviepy VideoClip (audio stripped).
-    """
-    import PIL.Image
-    if not hasattr(PIL.Image, "ANTIALIAS"):
-        PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
+) -> str:
+    """Extract `duration` seconds from video_path, resized to target dimensions.
 
-    # Probe duration via ffmpeg (supports H.265/HEVC natively — no re-encoding needed)
+    Fully ffmpeg-based — no MoviePy used.  Returns path to an H.264 mp4 file.
+    """
     clip_dur = _ffmpeg_probe_duration(video_path) or 0.0
     if clip_dur <= 0:
         raise ValueError(f"Could not determine duration for {video_path}")
@@ -587,7 +605,7 @@ def _extract_subclip(
     safe_end = clip_dur * 0.75
     max_start = safe_end - duration
 
-    if explicit_start_sec is not None and clip_dur > 0:
+    if explicit_start_sec is not None:
         start_t = float(explicit_start_sec) % clip_dur if loop_if_needed else max(0.0, min(clip_dur - duration, float(explicit_start_sec)))
     elif fixed_start_ratio is not None:
         start_t = max(0.0, min(clip_dur - duration, clip_dur * fixed_start_ratio))
@@ -597,47 +615,54 @@ def _extract_subclip(
         rng = random.Random(seed)
         start_t = rng.uniform(safe_start, max_start)
 
-    from moviepy.editor import VideoFileClip
+    output_path = f"{video_path}.{int(start_t * 1000)}.{int(duration * 1000)}.out.mp4"
 
-    if loop_if_needed and clip_dur > 0:
-        # For looping (draft preview): pre-encode full video to H.264, then subclip in moviepy
-        encoded_path = video_path + ".h264loop.mp4"
-        def _encoded_file_ok(path: str) -> bool:
-            return (
-                os.path.exists(path)
-                and os.path.getsize(path) > 1000
-                and _ffmpeg_probe_duration(path) is not None
+    needs_loop = loop_if_needed and duration > (clip_dur - start_t + 0.05)
+    if needs_loop:
+        # Build a concat list with enough repetitions of the source video,
+        # then seek+trim+resize in one ffmpeg pass — no extra ffmpeg processes left open.
+        import math
+        reps = math.ceil((start_t + duration) / clip_dur) + 1
+        concat_list = output_path + ".loop_list.txt"
+        with open(concat_list, "w") as _f:
+            for _ in range(reps):
+                _f.write(f"file '{video_path}'\n")
+        if cover_crop:
+            vf = (
+                f"scale=w='if(gt(iw/ih,{target_w}/{target_h}),{target_w},-2)':"
+                f"h='if(gt(iw/ih,{target_w}/{target_h}),-2,{target_h})',"
+                f"crop={target_w}:{target_h}"
             )
-        if not _encoded_file_ok(encoded_path):
-            _ffmpeg_cut_clip(video_path, 0, clip_dur, encoded_path)
-        if not _encoded_file_ok(encoded_path):
-            raise ValueError(f"Cannot re-encode video to H.264 (incompatible codec?): {video_path}")
-        clip = VideoFileClip(encoded_path, audio=False)
-        from moviepy.editor import concatenate_videoclips
-        remaining = float(duration)
-        cursor = start_t
-        parts = []
-        while remaining > 0:
-            take = min(remaining, clip_dur - cursor)
-            if take <= 0:
-                cursor = 0.0
-                continue
-            parts.append(clip.subclip(cursor, cursor + take))
-            remaining -= take
-            cursor = 0.0
-        sub = parts[0] if len(parts) == 1 else concatenate_videoclips(parts, method="chain")
+        else:
+            vf = f"scale={target_w}:{target_h}"
+        ffmpeg_bin = _get_ffmpeg_path() or "ffmpeg"
+        result = subprocess.run(
+            [
+                ffmpeg_bin, "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", concat_list,
+                "-ss", f"{start_t:.3f}",
+                "-t", f"{duration:.3f}",
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-an",
+                output_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        ok = result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+        if not ok:
+            err = result.stderr.decode("utf-8", errors="ignore")[-400:] if result.stderr else ""
+            raise ValueError(f"ffmpeg loop concat failed (rc={result.returncode}): {err}")
+        return output_path
     else:
         end_t = min(start_t + duration, clip_dur)
         actual_dur = end_t - start_t
-        # Cut clip to temp file using ffmpeg — handles H.265/HEVC, outputs H.264
-        clip_tmp = f"{video_path}.{int(start_t * 1000)}.clip.mp4"
-        if not _ffmpeg_cut_clip(video_path, start_t, actual_dur, clip_tmp):
+        if not _ffmpeg_cut_clip(video_path, start_t, actual_dur, output_path, target_w, target_h, cover_crop):
             raise ValueError(f"ffmpeg failed to extract clip at {start_t:.2f}s from {video_path}")
-        clip = VideoFileClip(clip_tmp, audio=False)
-        sub = clip
-
-    sub = _resize_cover(sub, target_w, target_h) if cover_crop else sub.resize((target_w, target_h))
-    return sub
+        return output_path
 
 
 from app.workers.celery_app import celery_app
@@ -800,10 +825,8 @@ def render_video(
         with open(audio_path, "wb") as fh:
             fh.write(storage.download_file(song.file_key))
 
-        # Pre-trim audio NOW — before VideoFileClip objects are opened.
-        # Each VideoFileClip keeps an ffmpeg process alive; with 9+ clips open,
-        # any new subprocess hits the container's process/fd limit (EAGAIN).
-        # Running the trim here ensures 0 ffmpeg processes are open yet.
+        # Pre-trim audio now, while no other ffmpeg processes are running.
+        # Converts VBR MP3 to PCM WAV so the mux step has a reliable, exact-length source.
         _audio_trim_path = audio_path + ".trim.wav"
         _audio_trim_ok = False
         try:
@@ -837,11 +860,10 @@ def render_video(
         except Exception as _te:
             logger.warning("Audio pre-trim exception: %s", _te)
 
-        # ── 5. Build clips with moviepy ───────────────────────────────────
+        # ── 5. Extract clip files (pure ffmpeg, no MoviePy readers) ─────────
         set_job_status(task_id, "running", progress=62)
-        from moviepy.editor import concatenate_videoclips
-
-        clips = []
+        clip_paths: list[str] = []
+        total_video_dur = 0.0
         duration_cache: dict[str, float] = {}
         prev_vid_id: str | None = None
         prev_source_start_sec = 0.0
@@ -854,13 +876,11 @@ def render_video(
 
             vid_file = downloaded.get(vid.id)
             if not vid_file:
-                # fallback to any available download
                 vid_file = next(iter(downloaded.values()), None)
             if not vid_file:
                 continue
 
             try:
-                # Use (song_id + section start) as deterministic seed for clip position
                 seed = hash(f"{song_id}:{section['start']}")
                 if is_draft_render:
                     vid_dur = duration_cache.get(vid_file)
@@ -877,7 +897,7 @@ def render_video(
                 else:
                     source_start_sec = None
 
-                sub = _extract_subclip(
+                clip_path = _extract_subclip(
                     vid_file,
                     section_dur,
                     seed,
@@ -887,7 +907,8 @@ def render_video(
                     loop_if_needed=is_draft_render,
                     cover_crop=is_draft_render,
                 )
-                clips.append(sub)
+                clip_paths.append(clip_path)
+                total_video_dur += section_dur
             except Exception as e:
                 logger.warning(
                     "Failed to extract clip for section %s (%.1fs): %s",
@@ -896,30 +917,42 @@ def render_video(
                     e,
                 )
 
-        if not clips:
+        if not clip_paths:
             raise ValueError("No clips could be extracted from the downloaded videos")
 
-        # ── 6. Concatenate clips ──────────────────────────────────────────
+        # ── 6. Concatenate clips via ffmpeg concat demuxer (no MoviePy) ───
         set_job_status(task_id, "running", progress=78)
-        final_video = concatenate_videoclips(clips, method="compose")
+        _ffmpeg_bin = _get_ffmpeg_path() or "ffmpeg"
+        concat_list_path = os.path.join(work_dir, "concat_list.txt")
+        with open(concat_list_path, "w") as _f:
+            for _p in clip_paths:
+                _f.write(f"file '{_p}'\n")
 
-        # Compute min_dur using ffmpeg probe — avoids opening an AudioFileClip
-        # subprocess while 9+ VideoFileClip ffmpeg processes are already running.
+        silent_path = os.path.join(work_dir, "render_silent.mp4")
+        _concat_result = subprocess.run(
+            [_ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path,
+             "-c", "copy", silent_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=300,
+        )
+        if _concat_result.returncode != 0:
+            _concat_err = _concat_result.stderr.decode("utf-8", errors="ignore")[-400:] if _concat_result.stderr else ""
+            raise ValueError(f"ffmpeg concat failed (rc={_concat_result.returncode}): {_concat_err}")
+
+        # Probe the concatenated video for its actual duration
+        actual_video_dur = _ffmpeg_probe_duration(silent_path) or total_video_dur
+
+        # Determine how much audio is usable
         if _audio_trim_ok:
-            _trim_dur = _ffmpeg_probe_duration(_audio_trim_path) or 0.0
-            min_dur = min(final_video.duration, _trim_dur) if _trim_dur > 0 else final_video.duration
+            _audio_avail = _ffmpeg_probe_duration(_audio_trim_path) or 0.0
         else:
-            _mp3_dur = _ffmpeg_probe_duration(audio_path) or 0.0
-            if _mp3_dur > 0:
-                # Large margin for VBR imprecision; audio is read from clip_start offset
-                _safe_audio_len = max(0.1, (_mp3_dur - 1.5) - clip_start)
-            else:
-                _safe_audio_len = clip_end - clip_start
-            min_dur = min(final_video.duration, _safe_audio_len)
+            _raw_mp3_dur = _ffmpeg_probe_duration(audio_path) or 0.0
+            _audio_avail = max(0.1, (_raw_mp3_dur - 1.5) - clip_start) if _raw_mp3_dur > 0 else (clip_end - clip_start)
 
-        final_video = final_video.subclip(0, min_dur)
+        min_dur = min(actual_video_dur, _audio_avail) if _audio_avail > 0 else actual_video_dur
 
-        # ── 6.1 Burn-in lyric overlay for draft renders (match draft preview style) ──
+        # ── 6.1 Prepare lyric overlay data for draft renders ─────────────
         lyrics_lines_used = 0
         lines_rel_for_burn: list[dict] = []
         style_for_burn: dict | None = None
@@ -928,7 +961,6 @@ def render_video(
             source_lines = _normalize_lyrics_lines(lyrics_lines) if lyrics_lines else _normalize_lyrics_lines(song.lyrics_lines)
             lines_rel: list[dict] = []
             for line in source_lines:
-                # song-level lyric timings are absolute; convert to clip-relative.
                 rel_start = float(line["start"]) - float(clip_start)
                 rel_end = float(line["end"]) - float(clip_start)
                 if rel_end <= 0 or rel_start >= min_dur:
@@ -942,58 +974,29 @@ def render_video(
                     "end": round(rel_end, 3),
                     "text": line["text"],
                 })
-
             if lines_rel:
                 lyrics_lines_used = len(lines_rel)
                 lines_rel_for_burn = lines_rel
                 style_for_burn = style
-                logger.info(
-                    "lyrics burn prepared: lines=%s style=%s",
-                    lyrics_lines_used,
-                    style_for_burn,
-                )
+                logger.info("lyrics burn prepared: lines=%s style=%s", lyrics_lines_used, style_for_burn)
 
-        # ── 7. Write video (silent), then mux audio via ffmpeg ───────────
-        # Writing silent first lets us close all VideoFileClip ffmpeg processes
-        # before opening any new subprocess — prevents EAGAIN under process limits.
+        # ── 7. Mux audio into silent video via ffmpeg ─────────────────────
+        # All MoviePy/ffmpeg reader processes are already closed at this point.
+        # Running a single mux subprocess is safe from process-limit issues.
         set_job_status(task_id, "running", progress=85)
-        silent_path = os.path.join(work_dir, "render_silent.mp4")
         output_path = os.path.join(work_dir, "render.mp4")
-        final_video.write_videofile(
-            silent_path,
-            codec="libx264",
-            audio=False,
-            fps=24,
-            preset="ultrafast",
-            threads=2,
-            logger=None,
-        )
-
-        # Release all MoviePy ffmpeg reader processes before the mux subprocess.
-        try:
-            final_video.close()
-            for c in clips:
-                c.close()
-            clips.clear()
-        except Exception:
-            pass
-
-        # Mux audio directly with ffmpeg — no MoviePy audio reader needed.
-        _ffmpeg_bin = _get_ffmpeg_path() or "ffmpeg"
         if _audio_trim_ok:
-            # WAV already trimmed to (clip_start → safe_end); starts at t=0
             _mux_audio_args = ["-i", _audio_trim_path]
         else:
-            # Original MP3: seek to clip_start, rely on -shortest to stop at video end
             _mux_audio_args = ["-ss", f"{clip_start:.3f}", "-i", audio_path]
         _mux_result = subprocess.run(
             [
                 _ffmpeg_bin, "-y",
                 "-i", silent_path,
                 *_mux_audio_args,
+                "-t", f"{min_dur:.3f}",
                 "-c:v", "copy",
                 "-c:a", "aac",
-                "-shortest",
                 output_path,
             ],
             stdout=subprocess.DEVNULL,
@@ -1003,7 +1006,7 @@ def render_video(
         if _mux_result.returncode != 0:
             _mux_err = _mux_result.stderr.decode("utf-8", errors="ignore")[-400:] if _mux_result.stderr else ""
             raise ValueError(f"ffmpeg audio mux failed (rc={_mux_result.returncode}): {_mux_err}")
-        logger.info("Audio muxed successfully → %s", output_path)
+        logger.info("Audio muxed successfully → %s (%.2fs)", output_path, min_dur)
 
         if is_draft_render and lines_rel_for_burn and style_for_burn:
             burned_path = os.path.join(work_dir, "render_burned.mp4")
@@ -1015,15 +1018,6 @@ def render_video(
                     output_path = fallback_path
 
         render_duration = round(float(min_dur), 2)
-
-        # MoviePy objects were already closed after write_videofile above.
-        # This is a safety net in case an early-exit path left them open.
-        try:
-            final_video.close()
-            for c in clips:
-                c.close()
-        except Exception:
-            pass
 
         # ── 8. Upload to MinIO / R2 ───────────────────────────────────────
         set_job_status(task_id, "running", progress=95)
