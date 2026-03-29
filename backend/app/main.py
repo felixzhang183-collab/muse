@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.config import settings
 from app.routers import aesthetics, analytics, auth, distributions, drafts, jobs, renders, section_templates, songs, tiktok, videos
 
 app = FastAPI(
