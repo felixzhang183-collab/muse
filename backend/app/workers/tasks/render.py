@@ -796,7 +796,9 @@ def render_video(
 
         audio = AudioFileClip(audio_path)
         # Apply clip region: trim audio to [clip_start, clip_end]
-        audio = audio.subclip(clip_start, min(clip_end, audio.duration))
+        # Subtract a small margin to avoid reading past the end of the audio buffer.
+        safe_audio_dur = max(0.0, audio.duration - 0.1)
+        audio = audio.subclip(clip_start, min(clip_end, safe_audio_dur))
         min_dur = min(final_video.duration, audio.duration)
         final_video = final_video.subclip(0, min_dur)
         audio = audio.subclip(0, min_dur)
