@@ -839,7 +839,7 @@ def render_video(
 
         # ── 5. Build clips with moviepy ───────────────────────────────────
         set_job_status(task_id, "running", progress=62)
-        from moviepy.editor import AudioFileClip, concatenate_videoclips
+        from moviepy.editor import concatenate_videoclips
 
         clips = []
         duration_cache: dict[str, float] = {}
@@ -899,26 +899,25 @@ def render_video(
         if not clips:
             raise ValueError("No clips could be extracted from the downloaded videos")
 
-        # ── 6. Concatenate + overlay song audio ───────────────────────────
+        # ── 6. Concatenate clips ──────────────────────────────────────────
         set_job_status(task_id, "running", progress=78)
         final_video = concatenate_videoclips(clips, method="compose")
 
-        # Audio was pre-trimmed to WAV before clip extraction (see step 4.5 above).
-        # Using the pre-trimmed file avoids VBR MP3 buffer overrun AND the EAGAIN
-        # process-limit issue that occurs when 9+ VideoFileClip ffmpeg processes are open.
+        # Compute min_dur using ffmpeg probe — avoids opening an AudioFileClip
+        # subprocess while 9+ VideoFileClip ffmpeg processes are already running.
         if _audio_trim_ok:
-            audio = AudioFileClip(_audio_trim_path)
-            min_dur = min(final_video.duration, audio.duration)
+            _trim_dur = _ffmpeg_probe_duration(_audio_trim_path) or 0.0
+            min_dur = min(final_video.duration, _trim_dur) if _trim_dur > 0 else final_video.duration
         else:
-            # Fallback: MoviePy subclip with large safety margin
-            audio = AudioFileClip(audio_path)
-            safe_audio_end = max(0.0, audio.duration - 1.5)
-            audio = audio.subclip(clip_start, min(clip_end, safe_audio_end))
-            min_dur = min(final_video.duration, audio.duration)
+            _mp3_dur = _ffmpeg_probe_duration(audio_path) or 0.0
+            if _mp3_dur > 0:
+                # Large margin for VBR imprecision; audio is read from clip_start offset
+                _safe_audio_len = max(0.1, (_mp3_dur - 1.5) - clip_start)
+            else:
+                _safe_audio_len = clip_end - clip_start
+            min_dur = min(final_video.duration, _safe_audio_len)
 
         final_video = final_video.subclip(0, min_dur)
-        audio = audio.subclip(0, min_dur)
-        final_video = final_video.set_audio(audio)
 
         # ── 6.1 Burn-in lyric overlay for draft renders (match draft preview style) ──
         lyrics_lines_used = 0
@@ -954,20 +953,57 @@ def render_video(
                     style_for_burn,
                 )
 
-        # ── 7. Write output file ──────────────────────────────────────────
+        # ── 7. Write video (silent), then mux audio via ffmpeg ───────────
+        # Writing silent first lets us close all VideoFileClip ffmpeg processes
+        # before opening any new subprocess — prevents EAGAIN under process limits.
         set_job_status(task_id, "running", progress=85)
+        silent_path = os.path.join(work_dir, "render_silent.mp4")
         output_path = os.path.join(work_dir, "render.mp4")
         final_video.write_videofile(
-            output_path,
+            silent_path,
             codec="libx264",
-            audio_codec="aac",
-            temp_audiofile=os.path.join(work_dir, "temp_audio.m4a"),
-            remove_temp=True,
+            audio=False,
             fps=24,
             preset="ultrafast",
             threads=2,
             logger=None,
         )
+
+        # Release all MoviePy ffmpeg reader processes before the mux subprocess.
+        try:
+            final_video.close()
+            for c in clips:
+                c.close()
+            clips.clear()
+        except Exception:
+            pass
+
+        # Mux audio directly with ffmpeg — no MoviePy audio reader needed.
+        _ffmpeg_bin = _get_ffmpeg_path() or "ffmpeg"
+        if _audio_trim_ok:
+            # WAV already trimmed to (clip_start → safe_end); starts at t=0
+            _mux_audio_args = ["-i", _audio_trim_path]
+        else:
+            # Original MP3: seek to clip_start, rely on -shortest to stop at video end
+            _mux_audio_args = ["-ss", f"{clip_start:.3f}", "-i", audio_path]
+        _mux_result = subprocess.run(
+            [
+                _ffmpeg_bin, "-y",
+                "-i", silent_path,
+                *_mux_audio_args,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                output_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=300,
+        )
+        if _mux_result.returncode != 0:
+            _mux_err = _mux_result.stderr.decode("utf-8", errors="ignore")[-400:] if _mux_result.stderr else ""
+            raise ValueError(f"ffmpeg audio mux failed (rc={_mux_result.returncode}): {_mux_err}")
+        logger.info("Audio muxed successfully → %s", output_path)
 
         if is_draft_render and lines_rel_for_burn and style_for_burn:
             burned_path = os.path.join(work_dir, "render_burned.mp4")
@@ -978,12 +1014,12 @@ def render_video(
                 if _burn_lyrics_with_moviepy(output_path, fallback_path, lines_rel_for_burn, style_for_burn):
                     output_path = fallback_path
 
-        render_duration = round(float(final_video.duration), 2)
+        render_duration = round(float(min_dur), 2)
 
-        # Clean up moviepy objects
+        # MoviePy objects were already closed after write_videofile above.
+        # This is a safety net in case an early-exit path left them open.
         try:
             final_video.close()
-            audio.close()
             for c in clips:
                 c.close()
         except Exception:
