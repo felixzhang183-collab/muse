@@ -403,31 +403,74 @@ def _get_ffmpeg_path() -> str | None:
         return None
 
 
-def _reencode_to_h264(input_path: str) -> str:
-    """Re-encode a video to H.264/AAC mp4 in-place. Returns the (possibly new) path."""
-    import subprocess
-    output_path = input_path + ".reenc.mp4"
+def _ffmpeg_probe_duration(video_path: str) -> float | None:
+    """Get video duration using ffmpeg -i (handles all codecs including H.265/HEVC)."""
+    import re
+    ffmpeg_bin = _get_ffmpeg_path() or "ffmpeg"
+    try:
+        result = subprocess.run(
+            [ffmpeg_bin, "-i", video_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+        for line in result.stderr.decode("utf-8", errors="ignore").splitlines():
+            m = re.search(r"Duration:\s+(\d+):(\d+):([\d.]+)", line)
+            if m:
+                h, m2, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                return h * 3600 + m2 * 60 + s
+    except Exception:
+        pass
+    return None
+
+
+def _ffmpeg_probe_dims(video_path: str) -> tuple[int, int] | None:
+    """Get video (width, height) using ffmpeg -i (handles all codecs including H.265/HEVC)."""
+    import re
+    ffmpeg_bin = _get_ffmpeg_path() or "ffmpeg"
+    try:
+        result = subprocess.run(
+            [ffmpeg_bin, "-i", video_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+        for line in result.stderr.decode("utf-8", errors="ignore").splitlines():
+            if "Video:" in line:
+                m = re.search(r"(\d{2,5})x(\d{2,5})", line)
+                if m:
+                    return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return None
+
+
+def _ffmpeg_cut_clip(input_path: str, start: float, duration: float, output_path: str) -> bool:
+    """Extract a clip from input_path using ffmpeg. Handles H.265/HEVC. Returns True on success."""
     ffmpeg_bin = _get_ffmpeg_path() or "ffmpeg"
     try:
         result = subprocess.run(
             [
-                ffmpeg_bin, "-y", "-i", input_path,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart",
+                ffmpeg_bin, "-y",
+                "-ss", f"{start:.3f}",
+                "-i", input_path,
+                "-t", f"{duration:.3f}",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-an",
                 output_path,
             ],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=120,
+            stderr=subprocess.PIPE,
+            timeout=60,
         )
-        if result.returncode == 0 and os.path.exists(output_path):
-            os.replace(output_path, input_path)
+        ok = result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        if not ok:
+            err = result.stderr.decode("utf-8", errors="ignore")[-400:] if result.stderr else ""
+            logger.warning("ffmpeg_cut_clip failed for %s (rc=%d): %s", input_path, result.returncode, err)
+        return ok
     except Exception as e:
-        logger.warning("Re-encode failed for %s: %s", input_path, e)
-        if os.path.exists(output_path):
-            os.remove(output_path)
-    return input_path
+        logger.warning("ffmpeg_cut_clip exception for %s: %s", input_path, e)
+        return False
 
 
 def _download_video(source_url: str, work_dir: str) -> str | None:
@@ -462,7 +505,7 @@ def _download_video(source_url: str, work_dir: str) -> str | None:
                             filepath = os.path.join(work_dir, fname)
                             break
             if os.path.exists(filepath):
-                return _reencode_to_h264(filepath)
+                return filepath
     except Exception as e:
         logger.warning("yt-dlp failed for %s: %s", source_url, e)
     return None
@@ -470,6 +513,10 @@ def _download_video(source_url: str, work_dir: str) -> str | None:
 
 def _detect_output_dims(video_path: str) -> tuple[int, int]:
     """Return (width, height) for the output, preserving portrait (9:16) or landscape (16:9)."""
+    dims = _ffmpeg_probe_dims(video_path)
+    if dims:
+        w, h = dims
+        return (1080, 1920) if h > w else (_TARGET_W, _TARGET_H)
     try:
         from moviepy.editor import VideoFileClip
         clip = VideoFileClip(video_path, audio=False)
@@ -481,6 +528,9 @@ def _detect_output_dims(video_path: str) -> tuple[int, int]:
 
 
 def _get_video_duration(video_path: str) -> float | None:
+    dur = _ffmpeg_probe_duration(video_path)
+    if dur:
+        return dur
     try:
         from moviepy.editor import VideoFileClip
         clip = VideoFileClip(video_path, audio=False)
@@ -518,18 +568,18 @@ def _extract_subclip(
     cover_crop: bool = False,
 ):
     """
-    Open video_path, pick a start position in the safe zone (20-75% of clip),
-    extract `duration` seconds, resize to target dimensions.
+    Extract `duration` seconds from video_path, resize to target dimensions.
+    Uses ffmpeg subprocess for clip extraction to support all codecs (H.265/HEVC, H.264, etc.).
     Returns a moviepy VideoClip (audio stripped).
     """
     import PIL.Image
     if not hasattr(PIL.Image, "ANTIALIAS"):
         PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 
-    from moviepy.editor import VideoFileClip
-
-    clip = VideoFileClip(video_path, audio=False)
-    clip_dur = clip.duration
+    # Probe duration via ffmpeg (supports H.265/HEVC natively — no re-encoding needed)
+    clip_dur = _ffmpeg_probe_duration(video_path) or 0.0
+    if clip_dur <= 0:
+        raise ValueError(f"Could not determine duration for {video_path}")
 
     safe_start = clip_dur * 0.20
     safe_end = clip_dur * 0.75
@@ -545,9 +595,16 @@ def _extract_subclip(
         rng = random.Random(seed)
         start_t = rng.uniform(safe_start, max_start)
 
-    if loop_if_needed and clip_dur > 0:
-        from moviepy.editor import concatenate_videoclips
+    from moviepy.editor import VideoFileClip
 
+    if loop_if_needed and clip_dur > 0:
+        # For looping (draft preview): pre-encode full video to H.264, then subclip in moviepy
+        encoded_path = video_path + ".h264loop.mp4"
+        if not os.path.exists(encoded_path):
+            _ffmpeg_cut_clip(video_path, 0, clip_dur, encoded_path)
+        load_path = encoded_path if os.path.exists(encoded_path) else video_path
+        clip = VideoFileClip(load_path, audio=False)
+        from moviepy.editor import concatenate_videoclips
         remaining = float(duration)
         cursor = start_t
         parts = []
@@ -562,7 +619,13 @@ def _extract_subclip(
         sub = parts[0] if len(parts) == 1 else concatenate_videoclips(parts, method="chain")
     else:
         end_t = min(start_t + duration, clip_dur)
-        sub = clip.subclip(start_t, end_t)
+        actual_dur = end_t - start_t
+        # Cut clip to temp file using ffmpeg — handles H.265/HEVC, outputs H.264
+        clip_tmp = f"{video_path}.{int(start_t * 1000)}.clip.mp4"
+        if not _ffmpeg_cut_clip(video_path, start_t, actual_dur, clip_tmp):
+            raise ValueError(f"ffmpeg failed to extract clip at {start_t:.2f}s from {video_path}")
+        clip = VideoFileClip(clip_tmp, audio=False)
+        sub = clip
 
     sub = _resize_cover(sub, target_w, target_h) if cover_crop else sub.resize((target_w, target_h))
     return sub
