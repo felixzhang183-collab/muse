@@ -1343,7 +1343,7 @@ function DraftTimeline({
                     className={`text-[10px] px-2 py-0.5 rounded transition-colors ${
                       beatInterval === n
                         ? "bg-indigo-600 text-white"
-                        : "bg-paper-3 text-paper hover:bg-paper-2"
+                        : "bg-sub text-paper-2 hover:bg-surface-2"
                     }`}
                   >
                     {n === 1 ? "every beat" : n === 2 ? "every 2" : "every 4"}
