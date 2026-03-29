@@ -24,9 +24,14 @@ function Nav() {
   useEffect(() => {
     const token = localStorage.getItem("token");
     if (token && !user) {
-      getMe().then(setUser).catch(() => localStorage.removeItem("token"));
+      getMe().then(setUser).catch(() => {
+        localStorage.removeItem("token");
+        if (pathname !== "/auth") router.push("/auth");
+      });
+    } else if (!token && pathname !== "/auth") {
+      router.push("/auth");
     }
-  }, []);
+  }, [pathname]);
 
   function handleLogout() {
     logout();
