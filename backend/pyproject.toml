@@ -1,0 +1,50 @@
+[tool.poetry]
+name = "musicapp-backend"
+version = "0.1.0"
+description = "AI Music Marketing Automation Platform — backend"
+authors = []
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.115"
+uvicorn = {extras = ["standard"], version = "^0.32"}
+sqlalchemy = "^2.0"
+alembic = "^1.14"
+psycopg2-binary = "^2.9"
+celery = {extras = ["redis"], version = "^5.4"}
+redis = "^5.2"
+boto3 = "^1.35"
+python-multipart = "^0.0.12"
+pydantic-settings = "^2.6"
+email-validator = "^2.2"
+python-jose = {extras = ["cryptography"], version = "^3.3"}
+bcrypt = "^4.0"
+librosa = "^0.10"
+soundfile = "^0.12"
+llvmlite = ">=0.43.0,<0.45.0"
+numba = ">=0.60.0,<0.62.0"
+httpx = "^0.28"
+flower = "^2.0"
+openai = "^1.55"
+anthropic = "^0.40"
+qdrant-client = "^1.12"
+moviepy = ">=1.0,<2"
+yt-dlp = ">=2024.0"
+apify-client = ">=1.8"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+black = "^24.0"
+ruff = "^0.8"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
