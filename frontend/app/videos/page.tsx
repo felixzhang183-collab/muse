@@ -298,7 +298,7 @@ export default function VideosPage() {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && query.trim() && scrape.mutate()}
-            placeholder="e.g. dreamy lo-fi aesthetic, dark moody cinematic…"
+            placeholder="e.g. night citylight aesthetic, dark moody cinematic…"
             className="flex-1 min-w-0 bg-surface border border-sub px-4 py-2 font-data text-sm text-paper placeholder:text-paper-3 focus:outline-none focus:border-accent transition-colors"
           />
 
