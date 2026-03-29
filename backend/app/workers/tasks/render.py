@@ -403,6 +403,33 @@ def _get_ffmpeg_path() -> str | None:
         return None
 
 
+def _reencode_to_h264(input_path: str) -> str:
+    """Re-encode a video to H.264/AAC mp4 in-place. Returns the (possibly new) path."""
+    import subprocess
+    output_path = input_path + ".reenc.mp4"
+    ffmpeg_bin = _get_ffmpeg_path() or "ffmpeg"
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg_bin, "-y", "-i", input_path,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                output_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+        if result.returncode == 0 and os.path.exists(output_path):
+            os.replace(output_path, input_path)
+    except Exception as e:
+        logger.warning("Re-encode failed for %s: %s", input_path, e)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+    return input_path
+
+
 def _download_video(source_url: str, work_dir: str) -> str | None:
     """Download a video (YouTube or TikTok) to work_dir. Returns file path or None on failure."""
     import yt_dlp
@@ -423,16 +450,19 @@ def _download_video(source_url: str, work_dir: str) -> str | None:
             info = ydl.extract_info(source_url, download=True)
             video_id = info.get("id", "")
             filepath = ydl.prepare_filename(info)
+            if not os.path.exists(filepath):
+                # yt-dlp may rename after merge — scan work_dir for the id
+                for fname in os.listdir(work_dir):
+                    if video_id and fname.startswith(video_id):
+                        filepath = os.path.join(work_dir, fname)
+                        break
+                else:
+                    for fname in os.listdir(work_dir):
+                        if fname.endswith(".mp4"):
+                            filepath = os.path.join(work_dir, fname)
+                            break
             if os.path.exists(filepath):
-                return filepath
-            # yt-dlp may rename after merge — scan work_dir for the id
-            for fname in os.listdir(work_dir):
-                if video_id and fname.startswith(video_id):
-                    return os.path.join(work_dir, fname)
-            # last resort: return any mp4 in the work dir
-            for fname in os.listdir(work_dir):
-                if fname.endswith(".mp4"):
-                    return os.path.join(work_dir, fname)
+                return _reencode_to_h264(filepath)
     except Exception as e:
         logger.warning("yt-dlp failed for %s: %s", source_url, e)
     return None
