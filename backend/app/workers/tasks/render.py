@@ -796,10 +796,11 @@ def render_video(
 
         audio = AudioFileClip(audio_path)
         # Apply clip region: trim audio to [clip_start, clip_end]
-        # Subtract a small margin to avoid reading past the end of the audio buffer.
-        safe_audio_dur = max(0.0, audio.duration - 0.1)
-        audio = audio.subclip(clip_start, min(clip_end, safe_audio_dur))
-        min_dur = min(final_video.duration, audio.duration)
+        # Use a 0.5s safety margin to avoid reading past the end of the audio buffer
+        # (moviepy sometimes reports a duration slightly longer than actual data).
+        safe_audio_end = max(0.0, audio.duration - 0.5)
+        audio = audio.subclip(clip_start, min(clip_end, safe_audio_end))
+        min_dur = min(final_video.duration, max(0.0, audio.duration - 0.5))
         final_video = final_video.subclip(0, min_dur)
         audio = audio.subclip(0, min_dur)
         final_video = final_video.set_audio(audio)
