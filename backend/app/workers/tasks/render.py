@@ -455,6 +455,8 @@ def _ffmpeg_cut_clip(input_path: str, start: float, duration: float, output_path
                 "-ss", f"{start:.3f}",
                 "-i", input_path,
                 "-t", f"{duration:.3f}",
+                # scale to even dimensions (libx264 requires width/height divisible by 2)
+                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                 "-an",
                 output_path,
