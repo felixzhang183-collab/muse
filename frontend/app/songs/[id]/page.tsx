@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import { motion, AnimatePresence, useMotionValue, useSpring } from "framer-motion";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams } from "next/navigation";
 import {
@@ -84,6 +85,86 @@ function SectionEditor({ song }: { song: Song }) {
   const [isPlaying, setIsPlaying] = React.useState(false);
   const [currentTime, setCurrentTime] = React.useState(0);
 
+  // ── Web Audio API — live waveform visualizer ──────────────────────────────
+  const canvasRef = React.useRef<HTMLCanvasElement>(null);
+  const analyserRef = React.useRef<AnalyserNode | null>(null);
+  const audioCtxRef = React.useRef<AudioContext | null>(null);
+  const sourceConnectedRef = React.useRef(false);
+  const vizRafRef = React.useRef<number>(0);
+
+  const startVisualizer = React.useCallback(() => {
+    const audio = audioRef.current;
+    const canvas = canvasRef.current;
+    if (!audio || !canvas) return;
+
+    // create audio context + analyser once
+    if (!audioCtxRef.current) {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 128;
+      analyser.smoothingTimeConstant = 0.8;
+      if (!sourceConnectedRef.current) {
+        const source = ctx.createMediaElementSource(audio);
+        source.connect(analyser);
+        analyser.connect(ctx.destination);
+        sourceConnectedRef.current = true;
+      }
+      audioCtxRef.current = ctx;
+      analyserRef.current = analyser;
+    }
+    if (audioCtxRef.current.state === "suspended") {
+      audioCtxRef.current.resume();
+    }
+
+    const analyser = analyserRef.current!;
+    const bufLen = analyser.frequencyBinCount;
+    const dataArr = new Uint8Array(bufLen);
+    const ctx2d = canvas.getContext("2d")!;
+
+    const draw = () => {
+      vizRafRef.current = requestAnimationFrame(draw);
+      analyser.getByteFrequencyData(dataArr);
+
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx2d.clearRect(0, 0, w, h);
+
+      const barCount = Math.min(bufLen, 40);
+      const barW = (w / barCount) * 0.6;
+      const gap = (w / barCount) * 0.4;
+
+      for (let i = 0; i < barCount; i++) {
+        const val = dataArr[i] / 255;
+        const barH = Math.max(2, val * h * 0.9);
+        const x = i * (barW + gap);
+        const y = (h - barH) / 2;
+
+        // colour shifts from accent to white based on amplitude
+        const r = Math.round(196 + (255 - 196) * val);
+        const g = Math.round(154 + (255 - 154) * val);
+        const b = Math.round(108 + (255 - 108) * val);
+        ctx2d.fillStyle = `rgb(${r},${g},${b})`;
+        ctx2d.fillRect(x, y, barW, barH);
+      }
+    };
+    draw();
+  }, []);
+
+  const stopVisualizer = React.useCallback(() => {
+    cancelAnimationFrame(vizRafRef.current);
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx2d = canvas.getContext("2d");
+      if (ctx2d) ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }, []);
+
+  // clean up on unmount
+  React.useEffect(() => () => {
+    cancelAnimationFrame(vizRafRef.current);
+    audioCtxRef.current?.close();
+  }, []);
+
   const { data: streamUrl } = useQuery({
     queryKey: ["stream-url", song.id],
     queryFn: () => getStreamUrl(song.id),
@@ -107,6 +188,7 @@ function SectionEditor({ song }: { song: Song }) {
     const handleEnded = () => {
       setIsPlaying(false);
       cancelAnimationFrame(rafRef.current);
+      stopVisualizer();
     };
     audio.addEventListener("ended", handleEnded);
     return () => audio.removeEventListener("ended", handleEnded);
@@ -129,10 +211,12 @@ function SectionEditor({ song }: { song: Song }) {
       audio.play();
       setIsPlaying(true);
       startRaf();
+      startVisualizer();
     } else {
       audio.pause();
       setIsPlaying(false);
       cancelAnimationFrame(rafRef.current);
+      stopVisualizer();
     }
   };
 
@@ -336,23 +420,95 @@ function SectionEditor({ song }: { song: Song }) {
           </div>
         ))}
 
-        {/* Playhead */}
-        <div
-          className="absolute top-0 bottom-0 w-px bg-paper/90 z-20 pointer-events-none"
+        {/* Playhead — framer-motion so it glides smoothly */}
+        <motion.div
+          className="absolute top-0 bottom-0 w-px bg-paper z-20 pointer-events-none"
           style={{ left: `${(currentTime / duration) * 100}%` }}
-        />
+          animate={{ left: `${(currentTime / duration) * 100}%` }}
+          transition={{ duration: 0.05, ease: "linear" }}
+        >
+          {/* small triangle handle at top of playhead */}
+          <div className="absolute -top-0 left-1/2 -translate-x-1/2 w-2 h-2 bg-paper rotate-45" />
+        </motion.div>
+
+        {/* active section pulse overlay */}
+        {isPlaying && sections.map((sec, i) => {
+          const isActive = currentTime >= sec.start && currentTime < sec.end;
+          if (!isActive) return null;
+          return (
+            <motion.div
+              key={i}
+              className="absolute top-0 bottom-0 pointer-events-none z-10"
+              style={{
+                left: `${(sec.start / duration) * 100}%`,
+                width: `${((sec.end - sec.start) / duration) * 100}%`,
+              }}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: [0.15, 0.3, 0.15] }}
+              transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
+            >
+              <div className="absolute inset-0 bg-white/10 rounded-sm" />
+            </motion.div>
+          );
+        })}
       </div>
 
       {/* Audio controls */}
       <div className="flex items-center gap-3">
-        <button
+        {/* animated play/pause button */}
+        <motion.button
           onClick={togglePlayback}
           disabled={!streamUrl}
-          className="w-8 h-8 rounded-full bg-paper-3 hover:bg-paper-2 flex items-center justify-center text-sm transition-colors disabled:opacity-40"
+          whileTap={{ scale: 0.88 }}
+          animate={isPlaying ? { scale: [1, 1.08, 1] } : { scale: 1 }}
+          transition={isPlaying ? { duration: 0.6, repeat: Infinity, ease: "easeInOut" } : { duration: 0.15 }}
+          className="w-9 h-9 rounded-full bg-accent hover:bg-accent-dark flex items-center justify-center transition-colors disabled:opacity-40 shrink-0"
         >
-          {isPlaying ? "⏸" : "▶"}
-        </button>
-        <span className="text-xs text-paper-3 tabular-nums">
+          <AnimatePresence mode="wait">
+            {isPlaying ? (
+              <motion.div
+                key="pause"
+                initial={{ scale: 0, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0, opacity: 0 }}
+                transition={{ duration: 0.15 }}
+                className="flex gap-[3px] items-center"
+              >
+                <span className="w-[3px] h-3.5 bg-white rounded-sm block" />
+                <span className="w-[3px] h-3.5 bg-white rounded-sm block" />
+              </motion.div>
+            ) : (
+              <motion.div
+                key="play"
+                initial={{ scale: 0, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0, opacity: 0 }}
+                transition={{ duration: 0.15 }}
+                className="text-white text-sm ml-0.5"
+              >
+                ▶
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </motion.button>
+
+        {/* live waveform canvas — only visible while playing */}
+        <AnimatePresence>
+          {isPlaying && (
+            <motion.canvas
+              ref={canvasRef}
+              width={160}
+              height={36}
+              initial={{ opacity: 0, width: 0 }}
+              animate={{ opacity: 1, width: 160 }}
+              exit={{ opacity: 0, width: 0 }}
+              transition={{ duration: 0.3 }}
+              className="shrink-0"
+            />
+          )}
+        </AnimatePresence>
+
+        <span className="text-xs text-paper-3 tabular-nums font-data">
           {formatTime(currentTime)} / {formatTime(duration)}
         </span>
         <button
