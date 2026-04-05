@@ -453,15 +453,13 @@ function SectionEditor({ song }: { song: Song }) {
         })}
       </div>
 
-      {/* Audio controls */}
+      {/* Audio controls — fixed layout so canvas never shifts other elements */}
       <div className="flex items-center gap-3">
         {/* animated play/pause button */}
         <motion.button
           onClick={togglePlayback}
           disabled={!streamUrl}
           whileTap={{ scale: 0.88 }}
-          animate={isPlaying ? { scale: [1, 1.08, 1] } : { scale: 1 }}
-          transition={isPlaying ? { duration: 0.6, repeat: Infinity, ease: "easeInOut" } : { duration: 0.15 }}
           className="w-9 h-9 rounded-full bg-accent hover:bg-accent-dark flex items-center justify-center transition-colors disabled:opacity-40 shrink-0"
         >
           <AnimatePresence mode="wait">
@@ -492,21 +490,16 @@ function SectionEditor({ song }: { song: Song }) {
           </AnimatePresence>
         </motion.button>
 
-        {/* live waveform canvas — only visible while playing */}
-        <AnimatePresence>
-          {isPlaying && (
-            <motion.canvas
-              ref={canvasRef}
-              width={160}
-              height={36}
-              initial={{ opacity: 0, width: 0 }}
-              animate={{ opacity: 1, width: 160 }}
-              exit={{ opacity: 0, width: 0 }}
-              transition={{ duration: 0.3 }}
-              className="shrink-0"
-            />
+        {/* live waveform canvas — fixed width container so it never shifts siblings */}
+        <div className="w-[160px] h-9 shrink-0 relative">
+          <canvas ref={canvasRef} width={160} height={36} className="absolute inset-0" />
+          {!isPlaying && (
+            /* idle state: flat line */
+            <div className="absolute inset-0 flex items-center">
+              <div className="w-full h-px bg-sub" />
+            </div>
           )}
-        </AnimatePresence>
+        </div>
 
         <span className="text-xs text-paper-3 tabular-nums font-data">
           {formatTime(currentTime)} / {formatTime(duration)}
