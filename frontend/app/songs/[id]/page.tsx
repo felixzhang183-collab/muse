@@ -85,61 +85,38 @@ function SectionEditor({ song }: { song: Song }) {
   const [isPlaying, setIsPlaying] = React.useState(false);
   const [currentTime, setCurrentTime] = React.useState(0);
 
-  // ── Web Audio API — live waveform visualizer ──────────────────────────────
+  // ── Playhead DOM ref — updated directly to avoid re-rendering the whole component ──
+  const playheadRef = React.useRef<HTMLDivElement>(null);
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
-  const analyserRef = React.useRef<AnalyserNode | null>(null);
-  const audioCtxRef = React.useRef<AudioContext | null>(null);
-  const sourceConnectedRef = React.useRef(false);
   const vizRafRef = React.useRef<number>(0);
 
+  // draw a simple animated bar visualizer — no Web Audio API needed,
+  // avoids the createMediaElementSource issue that broke audio playback
   const startVisualizer = React.useCallback(() => {
-    const audio = audioRef.current;
     const canvas = canvasRef.current;
-    if (!audio || !canvas) return;
-
-    // create audio context + analyser once
-    if (!audioCtxRef.current) {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 128;
-      analyser.smoothingTimeConstant = 0.8;
-      if (!sourceConnectedRef.current) {
-        const source = ctx.createMediaElementSource(audio);
-        source.connect(analyser);
-        analyser.connect(ctx.destination);
-        sourceConnectedRef.current = true;
-      }
-      audioCtxRef.current = ctx;
-      analyserRef.current = analyser;
-    }
-    if (audioCtxRef.current.state === "suspended") {
-      audioCtxRef.current.resume();
-    }
-
-    const analyser = analyserRef.current!;
-    const bufLen = analyser.frequencyBinCount;
-    const dataArr = new Uint8Array(bufLen);
+    if (!canvas) return;
     const ctx2d = canvas.getContext("2d")!;
+    const barCount = 40;
+    let frame = 0;
 
     const draw = () => {
       vizRafRef.current = requestAnimationFrame(draw);
-      analyser.getByteFrequencyData(dataArr);
-
+      frame++;
       const w = canvas.width;
       const h = canvas.height;
       ctx2d.clearRect(0, 0, w, h);
-
-      const barCount = Math.min(bufLen, 40);
-      const barW = (w / barCount) * 0.6;
-      const gap = (w / barCount) * 0.4;
-
+      const barW = (w / barCount) * 0.55;
+      const gap = (w / barCount) * 0.45;
       for (let i = 0; i < barCount; i++) {
-        const val = dataArr[i] / 255;
-        const barH = Math.max(2, val * h * 0.9);
+        // pseudo-random animated height using sine waves at different frequencies
+        const val = Math.abs(
+          Math.sin(frame * 0.04 + i * 0.5) * 0.5 +
+          Math.sin(frame * 0.07 + i * 0.3) * 0.3 +
+          Math.sin(frame * 0.02 + i * 0.8) * 0.2
+        );
+        const barH = Math.max(2, val * h * 0.85);
         const x = i * (barW + gap);
         const y = (h - barH) / 2;
-
-        // colour shifts from accent to white based on amplitude
         const r = Math.round(196 + (255 - 196) * val);
         const g = Math.round(154 + (255 - 154) * val);
         const b = Math.round(108 + (255 - 108) * val);
@@ -154,16 +131,11 @@ function SectionEditor({ song }: { song: Song }) {
     cancelAnimationFrame(vizRafRef.current);
     const canvas = canvasRef.current;
     if (canvas) {
-      const ctx2d = canvas.getContext("2d");
-      if (ctx2d) ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+      canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
     }
   }, []);
 
-  // clean up on unmount
-  React.useEffect(() => () => {
-    cancelAnimationFrame(vizRafRef.current);
-    audioCtxRef.current?.close();
-  }, []);
+  React.useEffect(() => () => cancelAnimationFrame(vizRafRef.current), []);
 
   const { data: streamUrl } = useQuery({
     queryKey: ["stream-url", song.id],
@@ -197,8 +169,22 @@ function SectionEditor({ song }: { song: Song }) {
   React.useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
 
   const startRaf = () => {
+    let lastSecond = -1;
     const tick = () => {
-      setCurrentTime(audioRef.current?.currentTime ?? 0);
+      const t = audioRef.current?.currentTime ?? 0;
+
+      // move playhead directly in DOM — no React re-render
+      if (playheadRef.current && durationRef.current > 0) {
+        playheadRef.current.style.left = `${(t / durationRef.current) * 100}%`;
+      }
+
+      // only trigger a React state update once per second (for the time display)
+      const s = Math.floor(t);
+      if (s !== lastSecond) {
+        lastSecond = s;
+        setCurrentTime(t);
+      }
+
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -420,37 +406,14 @@ function SectionEditor({ song }: { song: Song }) {
           </div>
         ))}
 
-        {/* Playhead — framer-motion so it glides smoothly */}
-        <motion.div
+        {/* Playhead — moved via DOM ref in rAF loop, no React re-render */}
+        <div
+          ref={playheadRef}
           className="absolute top-0 bottom-0 w-px bg-paper z-20 pointer-events-none"
           style={{ left: `${(currentTime / duration) * 100}%` }}
-          animate={{ left: `${(currentTime / duration) * 100}%` }}
-          transition={{ duration: 0.05, ease: "linear" }}
         >
-          {/* small triangle handle at top of playhead */}
-          <div className="absolute -top-0 left-1/2 -translate-x-1/2 w-2 h-2 bg-paper rotate-45" />
-        </motion.div>
-
-        {/* active section pulse overlay */}
-        {isPlaying && sections.map((sec, i) => {
-          const isActive = currentTime >= sec.start && currentTime < sec.end;
-          if (!isActive) return null;
-          return (
-            <motion.div
-              key={i}
-              className="absolute top-0 bottom-0 pointer-events-none z-10"
-              style={{
-                left: `${(sec.start / duration) * 100}%`,
-                width: `${((sec.end - sec.start) / duration) * 100}%`,
-              }}
-              initial={{ opacity: 0 }}
-              animate={{ opacity: [0.15, 0.3, 0.15] }}
-              transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
-            >
-              <div className="absolute inset-0 bg-white/10 rounded-sm" />
-            </motion.div>
-          );
-        })}
+          <div className="absolute top-0 left-1/2 -translate-x-1/2 w-2 h-2 bg-paper rotate-45" />
+        </div>
       </div>
 
       {/* Audio controls — fixed layout so canvas never shifts other elements */}
