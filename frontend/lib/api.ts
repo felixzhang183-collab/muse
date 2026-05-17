@@ -330,6 +330,13 @@ export async function disconnectTikTok(): Promise<void> {
   await apiFetch("/tiktok/disconnect", { method: "POST" });
 }
 
+export async function exchangeTikTokCode(code: string, state: string): Promise<{ connected: boolean; open_id: string }> {
+  const res = await apiFetch<{ data: { connected: boolean; open_id: string } }>(
+    `/tiktok/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`
+  );
+  return res.data;
+}
+
 // ─── Distributions ────────────────────────────────────────────────────────────
 
 export async function distributeRender(renderId: string): Promise<{ distribution_id: string; job_id: string }> {

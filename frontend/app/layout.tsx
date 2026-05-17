@@ -31,7 +31,7 @@ function Nav() {
         localStorage.removeItem("token");
         if (pathname !== "/auth") router.push("/auth");
       });
-    } else if (!token && pathname !== "/auth" && pathname !== "/privacy" && pathname !== "/terms") {
+    } else if (!token && pathname !== "/auth" && pathname !== "/privacy" && pathname !== "/terms" && pathname !== "/tiktok/callback") {
       router.push("/auth");
     }
   }, [pathname]);
