@@ -1,10 +1,12 @@
 "use client";
 
+import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { getTikTokStatus, getTikTokAuthUrl, disconnectTikTok } from "@/lib/api";
 
 export default function TikTokPage() {
   const queryClient = useQueryClient();
+  const [connectError, setConnectError] = useState<string | null>(null);
 
   const { data: status, isLoading } = useQuery({
     queryKey: ["tiktok-status"],
@@ -16,6 +18,8 @@ export default function TikTokPage() {
       const { url } = await getTikTokAuthUrl();
       window.location.href = url;
     },
+    onMutate: () => setConnectError(null),
+    onError: (err: Error) => setConnectError(err.message),
   });
 
   const { mutate: disconnect, isPending: isDisconnecting } = useMutation({
@@ -67,7 +71,11 @@ export default function TikTokPage() {
             </button>
           )}
 
-          {!status?.connected && (
+          {connectError && (
+            <p className="font-data text-xs text-red-400 mt-3">{connectError}</p>
+          )}
+
+          {!status?.connected && !connectError && (
             <p className="font-data text-xs text-paper-3 mt-3">
               You&apos;ll be redirected to TikTok to authorize posting access.
             </p>

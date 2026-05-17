@@ -31,7 +31,7 @@ function Nav() {
         localStorage.removeItem("token");
         if (pathname !== "/auth") router.push("/auth");
       });
-    } else if (!token && pathname !== "/auth") {
+    } else if (!token && pathname !== "/auth" && pathname !== "/privacy" && pathname !== "/terms") {
       router.push("/auth");
     }
   }, [pathname]);
