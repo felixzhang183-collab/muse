@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { exchangeTikTokCode } from "@/lib/api";
 
 type State = "exchanging" | "success" | "error";
 
-export default function TikTokCallbackPage() {
+function TikTokCallbackInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [state, setState] = useState<State>("exchanging");
@@ -81,5 +81,13 @@ export default function TikTokCallbackPage() {
         </>
       )}
     </div>
+  );
+}
+
+export default function TikTokCallbackPage() {
+  return (
+    <Suspense>
+      <TikTokCallbackInner />
+    </Suspense>
   );
 }
