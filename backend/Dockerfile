@@ -13,13 +13,13 @@ WORKDIR /app
 RUN pip install poetry==1.8.4
 
 # Copy dependency files first (layer cache)
-COPY pyproject.toml poetry.lock* ./
+COPY backend/pyproject.toml backend/poetry.lock* ./
 
 # Install deps (no virtualenv inside container)
 RUN poetry config virtualenvs.create false \
     && poetry install --no-interaction --no-ansi --no-root
 
-COPY . .
+COPY backend/ .
 
 RUN chmod +x start.sh
 
